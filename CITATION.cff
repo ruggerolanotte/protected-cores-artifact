@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this artifact, please cite the accompanying paper."
+title: "Protected Cores Are Not Enough: Reproducibility Artifact"
+type: software
+authors:
+  - family-names: Lanotte
+    given-names: Ruggero
+version: 1.0.0
+date-released: 2026-09-27
+license: MIT
+repository-code: "https://github.com/ruggerolanotte/protected-cores-artifact"
+
