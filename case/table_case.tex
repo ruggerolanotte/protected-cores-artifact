@@ -1,7 +1,7 @@
 \begin{table}[t]
 \centering
 \small
-\caption{Monitored clinical-alarm case study and reference runtime.}
+\caption{ Incremental monitored alarm case study and reference runtime.}
 \label{tab:clinical-case}
 \begin{tabularx}{\linewidth}{@{}Xr@{}}
 \toprule
@@ -9,17 +9,19 @@ Quantity & Result \\
 \midrule
 Completed alarm obligations & 30,000 \\
 Observed protected share & 0.099 \\
-Candidate aggregate success & 0.953 \\
-Candidate protected success & 0.608 \\
+\shortstack[l]{Candidate aggregate frequency} & 0.953 \\
+\shortstack[l]{Candidate protected frequency} & 0.608 \\
+Proposals / structurally rejected / ranked & 5 / 1 / 4 \\
+Selected response window & [1,8] \\
 Aggregate-only activation sample & 3,321 \\
 Joint activation & not activated \\
 Pending outcome: origin / retroactive & 1 / 0 \\
-Baseline / governed median runtime & 72.0 / 217.6 ms \\
-Baseline / governed time per event & 0.240 / 0.725 $\mu$s \\
-Baseline / governed peak memory & 30.9 / 60.3 KiB \\
+Baseline / governed median runtime & \shortstack[r]{145.3 / 523.4 ms} \\
+\shortstack[l]{Baseline / governed mean time per event} & \shortstack[r]{0.484 / 1.745 $\mu$s} \\
+\shortstack[l]{Baseline / governed peak working memory} & \shortstack[r]{1.6 / 3.6 KiB} \\
 Baseline / governed peak pending & 1 / 2 \\
-Parallel-governor increment & 145.6 ms \\
-Reference runtime ratio & 3.02$\times$ \\
+Parallel-governor increment & \shortstack[r]{378.1 ms} \\
+Reference runtime ratio & \shortstack[r]{3.60$\times$} \\
 \bottomrule
 \end{tabularx}
 \end{table}

@@ -5,7 +5,7 @@ Dependencies: Python 3.10+, numpy, scipy, matplotlib, scikit-learn. No network o
 Run: python fac_experiments.py all --out results
      python fac_experiments.py rq2 --out results/rq2 --replicates 200
 For an inexpensive smoke run: python fac_experiments.py all --out smoke --quick
-The public ``all`` target regenerates only artifacts included in the paper.
+The public ``all`` target regenerates experiment outputs, including ancillary plots.
 """
 from __future__ import annotations
 # rq1_simulation.py (embedded standalone implementation)
@@ -29,13 +29,313 @@ from scipy.stats import binom
 from sklearn.ensemble import RandomForestRegressor
 
 
+# Executable fragment: Boolean trigger/response formulas and finite [a,b].
+# The governor is independent of the learned proposal-ranking mechanism.
+from dataclasses import dataclass, field, replace
+from collections import deque
+from functools import lru_cache
+
+ATOM_BITS = {'A': 1, 'C': 2, 'B': 4, 'D': 8}
+TOP, BOTTOM = ('true',), ('false',)
+A, C, B, D = (('atom', x) for x in ('A', 'C', 'B', 'D'))
+CORE_TRIGGER = ('and', A, C)
+ADAPT_TRIGGER = ('and', A, ('not', C))
+
+def boolean_value(formula, mask):
+    op, *args = formula
+    if op == 'true' and not args: return True
+    if op == 'false' and not args: return False
+    if op == 'atom' and len(args) == 1: return bool(mask & ATOM_BITS[args[0]])
+    if op == 'not' and len(args) == 1: return not boolean_value(args[0], mask)
+    if op in ('and', 'or') and len(args) == 2:
+        x, y = boolean_value(args[0], mask), boolean_value(args[1], mask)
+        return x and y if op == 'and' else x or y
+    raise ValueError('unsupported Boolean formula')
+
+@lru_cache(maxsize=None)
+def truth_table(formula):
+    return tuple(boolean_value(formula, mask) for mask in range(16))
+
+@dataclass(frozen=True, slots=True)
+class Specification:
+    core_trigger: tuple
+    adaptive_trigger: tuple
+    core_response: tuple
+    adaptive_response: tuple
+    threshold: float
+    lower: float
+    upper: float
+
+    def __post_init__(self):
+        if not (math.isfinite(self.lower) and math.isfinite(self.upper)
+                and 0 <= self.lower <= self.upper and 0 <= self.threshold <= 1):
+            raise ValueError('invalid specification parameters')
+        for f in (self.core_trigger, self.adaptive_trigger,
+                  self.core_response, self.adaptive_response): truth_table(f)
+
+    @property
+    def parameters(self): return self.threshold, self.lower, self.upper
+
+    @property
+    def trigger(self): return ('or', self.core_trigger, self.adaptive_trigger)
+
+    @property
+    def response(self): return ('and', self.core_response, self.adaptive_response)
+
+
+def specification(lam=.9, keep=True, require=False, lower=1, upper=1):
+    return Specification(CORE_TRIGGER, ADAPT_TRIGGER if keep else BOTTOM,
+                         B, D if require else TOP, lam, lower, upper)
+
+
+def revision_rejections(incumbent, candidate, envelope):
+    """All four checks in Definition admissible-revision; syntactic equality."""
+    errors = []
+    if (candidate.core_trigger != incumbent.core_trigger or
+            candidate.core_response != incumbent.core_response):
+        errors.append('protected_component_changed')
+    if (int(candidate.adaptive_trigger != incumbent.adaptive_trigger) +
+            int(candidate.adaptive_response != incumbent.adaptive_response)) > 1:
+        errors.append('two_adaptive_components_changed')
+    if candidate.parameters not in envelope: errors.append('outside_parameter_envelope')
+    if (candidate.adaptive_trigger == incumbent.adaptive_trigger and
+        candidate.adaptive_response == incumbent.adaptive_response and
+        candidate.parameters == incumbent.parameters): errors.append('no_revision')
+    return tuple(errors)
+
+
+@dataclass(slots=True)
+class PendingObligation:
+    origin: int
+    time: float
+    core: bool
+    success: bool = False
+
+@dataclass(frozen=True, slots=True)
+class CompletedObligation:
+    origin: int
+    completion: int
+    core: bool
+    outcome: int
+    version: int
+    specification: Specification
+
+class IncrementalMonitor:
+    """One immutable origin specification; strict t > origin_time + H completion.
+
+    H=b for this propositional response/trigger fragment. Retired monitors
+    accept no new origins but keep resolving their existing queue.
+    """
+    def __init__(self, spec, version=0, after=-1):
+        self.spec, self.version, self.after = spec, version, after
+        self.triggers, self.responses = truth_table(spec.trigger), truth_table(spec.response)
+        self.cores = truth_table(spec.core_trigger)
+        self.pending = deque()
+        self.accept_origins = True
+        self.last_index, self.last_time = -1, -math.inf
+        self.peak_pending = self.completed = self.generated = 0
+
+    def advance(self, index, timestamp, mask):
+        if index <= self.last_index or timestamp < self.last_time:
+            raise ValueError('event indices must increase; timestamps must not decrease')
+        self.last_index, self.last_time = index, timestamp
+        done = []
+        while self.pending and timestamp > self.pending[0].time + self.spec.upper:
+            p = self.pending.popleft()
+            done.append(CompletedObligation(p.origin, index, p.core, int(p.success),
+                                            self.version, self.spec))
+            self.completed += 1
+        if self.accept_origins and index > self.after and self.triggers[mask]:
+            self.pending.append(PendingObligation(index, timestamp, self.cores[mask]))
+            self.generated += 1
+        if self.responses[mask]:
+            for p in self.pending:
+                if self.spec.lower <= timestamp - p.time <= self.spec.upper:
+                    p.success = True
+        self.peak_pending = max(self.peak_pending, len(self.pending))
+        return done
+
+class CertificationEvidence:
+    def __init__(self, spec, delta, joint, core_threshold):
+        if not 0 < delta < 1: raise ValueError('invalid error allocation')
+        self.spec, self.core_threshold = spec, core_threshold
+        self.core_enabled = joint and spec.core_trigger != BOTTOM
+        self.all_budget = delta/2 if self.core_enabled else delta
+        self.core_budget = delta/2 if self.core_enabled else 0
+        self.n = self.s = self.nc = self.sc = 0
+        self.lower = self.core_lower = 0.0
+
+    def add(self, completed):
+        for x in completed:
+            self.n += 1; self.s += x.outcome
+            if x.core: self.nc += 1; self.sc += x.outcome
+        if completed:
+            self.lower = rq2_lower(self.s, self.n, self.all_budget)
+            if self.core_enabled:
+                self.core_lower = rq2_lower(self.sc, self.nc, self.core_budget)
+
+    def passes(self):
+        return self.n > 0 and self.lower >= self.spec.threshold and (
+            not self.core_enabled or (self.nc > 0 and self.core_lower >= self.core_threshold))
+
+class Governor:
+    """Single attempt per activated version; decision at n, activation at n+1.
+
+    Caller supplies drift-gated selection from observations already processed.
+    A rejected proposal does not consume the version's certification slot.
+    """
+    def __init__(self, incumbent, envelope, delta=.05, joint=True, core_threshold=.9):
+        if incumbent.parameters not in envelope: raise ValueError('incumbent outside envelope')
+        self.envelope, self.delta, self.joint = frozenset(envelope), delta, joint
+        self.core_threshold = core_threshold
+        self.active = IncrementalMonitor(incumbent)
+        self.retired = []
+        self.version = 0
+        self.attempted = False
+        self.candidate = self.evidence = None
+        self.selection_index = None
+        self.scheduled = None
+        self.last_index = -1
+        self.decisions, self.activations, self.selections = [], [], []
+        self.rejections = []
+        self.peak_pending = 0
+
+    def admissible(self, candidate):
+        return not revision_rejections(self.active.spec, candidate, self.envelope)
+
+    def select(self, candidate, index, drift_declared):
+        if index != self.last_index: raise ValueError('selection must follow processing its event')
+        if not drift_declared: raise ValueError('selection requires a drift declaration')
+        if self.attempted: raise ValueError('only one selected candidate per version')
+        reasons = revision_rejections(self.active.spec, candidate, self.envelope)
+        if reasons:
+            self.rejections.append((index, reasons)); return False
+        self.attempted = True
+        self.selection_index = index
+        self.candidate = IncrementalMonitor(candidate, self.version+1, after=index)
+        self.evidence = CertificationEvidence(candidate, self.delta/(2**(self.version+1)),
+                                               self.joint, self.core_threshold)
+        self.selections.append((index, candidate))
+        return True
+
+    def advance(self, index, timestamp, mask):
+        if index != self.last_index+1: raise ValueError('process consecutive event indices')
+        self.last_index = index
+        if self.scheduled is not None:
+            at, spec = self.scheduled
+            if index != at: raise AssertionError('activation must occur at next event')
+            self.active.accept_origins = False
+            self.retired.append(self.active)
+            self.version += 1
+            self.active = IncrementalMonitor(spec, self.version)
+            self.activations.append((index, spec))
+            self.scheduled = None
+            self.attempted = False
+            self.candidate = self.evidence = None
+        operational = self.active.advance(index, timestamp, mask)
+        for old in self.retired: operational.extend(old.advance(index, timestamp, mask))
+        self.retired = [x for x in self.retired if x.pending]
+        completed = []
+        if self.candidate is not None:
+            completed = self.candidate.advance(index, timestamp, mask)
+            self.evidence.add(completed)
+            if self.evidence.passes():
+                self.peak_pending = max(self.peak_pending, len(self.active.pending) +
+                    sum(len(x.pending) for x in self.retired) + len(self.candidate.pending))
+                self.decisions.append(dict(index=index, version=self.version,
+                    specification=self.candidate.spec, n=self.evidence.n, nc=self.evidence.nc,
+                    lower=self.evidence.lower, core_lower=self.evidence.core_lower))
+                self.scheduled = (index+1, self.candidate.spec)
+                # Certification obligations are never reclassified as operational.
+                self.candidate = None
+        pending = len(self.active.pending) + sum(len(x.pending) for x in self.retired)
+        if self.candidate is not None: pending += len(self.candidate.pending)
+        self.peak_pending = max(self.peak_pending, pending)
+        return operational, completed
+
+
+def event_masks(protected, response, adaptive=None):
+    n = np.arange(len(protected))
+    masks = ((n > 0) & (n % 3 == 0)).astype(np.uint8)
+    masks |= protected.astype(np.uint8) * 2
+    masks |= response.astype(np.uint8) * 4
+    if adaptive is not None: masks[1:] |= adaptive[:-1].astype(np.uint8) * 8
+    return masks
+
+
+def protocol_tests():
+    """Independent finite-trace oracle and boundary/protocol regression tests."""
+    s = specification(0, upper=8)
+    env = {(0,1,8),(0,1,3)}
+    bad = replace(s, core_response=TOP)
+    assert 'protected_component_changed' in revision_rejections(s,bad,env)
+    assert 'no_revision' in revision_rejections(s,s,env)
+    assert 'two_adaptive_components_changed' in revision_rejections(
+        s,replace(s,adaptive_trigger=BOTTOM,adaptive_response=D),env)
+    assert 'outside_parameter_envelope' in revision_rejections(s,replace(s,upper=9),env)
+    g = Governor(s, env, joint=False)
+    outputs=[]
+    for n in range(12):
+        op,_=g.advance(n,n,(1 if n in (0,2,7) else 0)|(4 if n==6 else 0))
+        outputs.extend(op)
+        if n==0:
+            assert not g.select(bad,n,True)
+            assert g.select(replace(s,upper=3),n,True)
+    x=next(x for x in outputs if x.origin==0)
+    assert x.outcome==1 and x.specification.upper==8 and x.version==0
+    assert g.decisions[0]['index']==6 and g.activations[0][0]==7
+    assert next(x for x in outputs if x.origin==7).specification.upper==3
+    # Zero-delay and ties: response visible now, admitted only strictly later.
+    z=IncrementalMonitor(specification(0,lower=0,upper=0))
+    assert z.advance(0,0,5)==[] and z.advance(1,0,1)==[]
+    got=z.advance(2,1,0)
+    assert [(a.origin,a.outcome) for a in got]==[(0,1),(1,0)]
+    # Overlap, repeated timestamps, and exact interval endpoints vs offline semantics.
+    rng=np.random.default_rng(404)
+    checks=0
+    for lower,upper in [(0,0),(0,2),(1,3),(2,2)]:
+        spec=specification(.9,require=True,lower=lower,upper=upper)
+        for rep in range(30):
+            times=np.cumsum(rng.integers(0,3,40)).tolist()
+            masks=rng.integers(0,16,40).tolist()
+            times.append(times[-1]+upper+1);masks.append(0)
+            mon=IncrementalMonitor(spec);actual=[]
+            for i,(t,v) in enumerate(zip(times,masks)): actual.extend(mon.advance(i,t,v))
+            expected=[]
+            for k,v in enumerate(masks):
+                if boolean_value(spec.trigger,v) and any(t>times[k]+upper for t in times[k:]):
+                    ok=any(lower<=times[i]-times[k]<=upper and boolean_value(spec.response,masks[i])
+                           for i in range(k,len(times)))
+                    c=next(i for i in range(k,len(times)) if times[i]>times[k]+upper)
+                    expected.append((k,c,int(ok)))
+            assert [(x.origin,x.completion,x.outcome) for x in actual]==expected
+            assert all(x.core==boolean_value(spec.core_trigger,masks[x.origin]) for x in actual)
+            checks+=1
+    # No prefix-origin reuse; a noncertifying candidate cannot be replaced.
+    s=specification(1,upper=1);t=replace(s,upper=2);g=Governor(s,{s.parameters,t.parameters},joint=False)
+    g.advance(0,0,1);g.select(t,0,True)
+    for n in range(1,5):g.advance(n,n,0)
+    assert g.evidence.n==0
+    try:g.select(t,4,True)
+    except ValueError:pass
+    else:raise AssertionError('second attempt accepted')
+    # Joint needs a nonempty core sample even for a zero threshold.
+    ev=CertificationEvidence(specification(0),.025,True,0)
+    ev.add([CompletedObligation(1,3,False,1,0,s)])
+    assert not ev.passes()
+    return dict(offline_trace_comparisons=checks, boundary_and_protocol_checks='passed',
+                origin_version_outcome=x.outcome, retroactive_short_window_outcome=0,
+                regression_decision_event=6, regression_activation_event=7)
+
+
 class AggregateAIProposer:
     """Frozen supervised proposer trained on independent synthetic tasks.
 
     The model predicts a candidate's future aggregate margin from its prefix
     aggregate frequency, trigger coverage, threshold, and two structural
-    indicators.  It deliberately receives no protected-group outcome rate:
-    the symbolic governor, not the proposer, is responsible for core safety.
+    indicators. For a core-only candidate the candidate frequency is the
+    protected-group rate; full-trigger candidates have no separate core feature.
+    The symbolic governor, not the proposer, is responsible for core safety.
     """
 
     def __init__(self, seed: int, training_tasks: int = 4000):
@@ -142,19 +442,19 @@ def rq1_run(args):
             w.writeheader()
             w.writerows(data)
     method_names = {
-        'direct': 'Direct proposal',
-        'fixed_repeated': 'Fixed-time, repeatedly tested',
-        'exact_spending': 'Exact test with spending',
-        'paper_hoeffding': "Paper's Hoeffding bound",
+        'direct': 'Direct activation',
+        'fixed_repeated': 'Repeated exact test',
+        'exact_spending': 'Spent exact test',
+        'paper_hoeffding': "Hoeffding bound",
     }
     tex = [r'\begin{table}[t]', r'\centering', r'\small',
            (r'\caption{RQ1 synthetic post-selection certification. Each row has '
             f'{args.replicates} independent replications and {args.max_completed:,} '
             r'completed-obligation opportunities. Wilson intervals measure Monte Carlo '
             r'variation; $q$ is the median completed count at activation.}'),
-           r'\label{tab:rq1-certification}', r'\resizebox{\linewidth}{!}{%',
+           r'\label{tab:rq1-certification}', 
            r'\begin{tabular}{@{}llrrrr@{}}', r'\toprule',
-           r'True $p$ & Procedure & Activations & Wilson 95\% (\%) & Median $q$ & Censored \\',
+           r'True $p$ & Procedure & Activations & \shortstack{Wilson 95\%\\(\%)} & \shortstack{Median\\$q$} & Censored \\',
            r'\midrule']
     for p in args.probabilities:
         rr = [r for r in rows if r['true_p'] == p]
@@ -164,7 +464,7 @@ def rq1_run(args):
             tex.append(f"{pcell} & {method_names[row['method']]} & "
                        f"{row['activations']}/{row['replicates']} & {interval} & "
                        f"{_fmt(row['median_completed_at_decision'])} & {row['censored']} \\\\")
-    tex.extend([r'\bottomrule', r'\end{tabular}}', r'\end{table}'])
+    tex.extend([r'\bottomrule', r'\end{tabular}', r'\end{table}'])
     (out / 'table_rq1.tex').write_text('\n'.join(tex) + '\n')
     fig, ax = plt.subplots(figsize=(7.1, 4.2), layout='constrained')
     x = np.arange(len(args.probabilities))
@@ -205,7 +505,7 @@ def rq1_cli(argv):
     rq1_run(a)
 
 # rq2_simulation.py (embedded standalone implementation)
-"""RQ2 event-stream experiment for Algorithm 1's single-candidate certification branch.
+"""RQ2 event-stream experiment for the governor's single-candidate certification branch.
 
 Requires Python 3.10+, NumPy, Matplotlib. No data or network access is needed.
 """
@@ -236,7 +536,7 @@ class rq2_Run:
     ai_predicted_margin: float
 
 def rq2_lower(successes: int, count: int, budget: float) -> float:
-    """Section 5's time-uniform, one-sided Hoeffding bound, or 0 if empty."""
+    """The paper's time-uniform, one-sided Hoeffding bound, or 0 if empty."""
     if not count:
         return 0.0
     radius = math.sqrt(math.log(math.pi ** 2 * count ** 2 / (6 * budget)) / (2 * count))
@@ -313,7 +613,7 @@ def rq2_proposer_audit(proposer: AggregateAIProposer, seed: int,
         exact += int(is_exact)
         regret = oracle[1] - learned[1]
         regrets.append(regret)
-        records.append(dict(task=task, exact_ranking=is_exact,
+        records.append(dict(task=task, optimal_choice=is_exact,
                             learned_keep=learned[2], learned_require=learned[3],
                             oracle_keep=oracle[2], oracle_require=oracle[3],
                             true_margin_regret=regret))
@@ -325,52 +625,22 @@ def rq2_run_method(protected, response, method: str, w: float, rep: int,
                    seed: int, horizon: int, delta: float, threshold: float,
                    core_threshold: float, p_core: float,
                    ai_keep: bool, ai_score: float) -> rq2_Run:
-    assert method in ('aggregate_only', 'joint')
-    delta_j = delta / 2
-    budget_all = delta_j if method == 'aggregate_only' else delta_j / 2
-    budget_core = delta_j / 2 if method == 'joint' else 0.0
-    n_selection = 0
-    active_version = 0
-    certification_monitor = True
-    n_all = s_all = n_core = s_core = 0
-    decision = None
-    operational_origins_after_activation = 0
-    retained_old_origins_completed = 0
-    operational_origin_versions: list[int] = []
-    candidate_origins: set[int] = set()
-    for n in range(horizon + 1):
-        if n >= 2:
-            k = n - 2
-            assert k < len(operational_origin_versions)
-            if operational_origin_versions[k] == 0 and active_version == 1:
-                retained_old_origins_completed += 1
-            if certification_monitor and k in candidate_origins:
-                x = int(response[k + 1])
-                n_all += 1
-                s_all += x
-                if protected[k]:
-                    n_core += 1
-                    s_core += x
-                candidate_origins.remove(k)
-        is_origin = n > 0 and n % 3 == 0
-        operational_origin_versions.append(active_version if is_origin else -1)
-        if is_origin and active_version == 1:
-            operational_origins_after_activation += 1
-        if certification_monitor and is_origin and (ai_keep or protected[n]):
-            candidate_origins.add(n)
-        if certification_monitor and n > n_selection and n_all:
-            pass_all = rq2_lower(s_all, n_all, budget_all) >= threshold
-            pass_core = method == 'aggregate_only' or (n_core > 0 and rq2_lower(s_core, n_core, budget_core) >= core_threshold)
-            if pass_all and pass_core:
-                decision = n
-                certification_monitor = False
-                candidate_origins.clear()
-                active_version = 1
-    activated = decision is not None
-    return rq2_Run(method, w, rep, seed, activated,
-                   activated and p_core < core_threshold, decision, n_all,
-                   n_core, operational_origins_after_activation,
-                   retained_old_origins_completed, ai_keep, ai_score)
+    # Candidate selection at index 0 from a fixed full-trigger [1,2] incumbent.
+    incumbent=specification(threshold,True,False,upper=2)
+    candidate=specification(threshold,ai_keep,False)
+    g=Governor(incumbent,{incumbent.parameters,candidate.parameters},delta,method=='joint',core_threshold)
+    masks=event_masks(protected,response)
+    decision=None; n_all=n_core=after=retained=0
+    for n,v in enumerate(masks):
+        op,cert=g.advance(n,n,int(v))
+        if n==0: assert g.select(candidate,n,True)
+        after += int(bool(v&1) and g.version==1 and g.active.triggers[int(v)])
+        retained += sum(x.version==0 and g.version>0 for x in op)
+        if cert: n_all+=len(cert);n_core+=sum(x.core for x in cert)
+        if g.decisions and decision is None:decision=g.decisions[0]['index']
+    activated=bool(g.activations)
+    return rq2_Run(method,w,rep,seed,activated,activated and p_core<core_threshold,
+                   decision,n_all,n_core,after,retained,ai_keep,ai_score)
 
 def rq2_wilson(k: int, n: int, z: float=1.959963984540054) -> tuple[float, float]:
     phat = k / n
@@ -394,7 +664,7 @@ def rq2_summarize(runs: list[rq2_Run], horizon: int):
 
 def rq2_plot(rows, output: Path, horizon: int, delta: float, threshold: float, core_threshold: float):
     fig, ax = plt.subplots(figsize=(7.0, 4.4), layout='constrained')
-    for method, color, marker, label in (('aggregate_only', '#b04a32', 'o', 'Aggregate only'), ('joint', '#236f92', 's', 'Aggregate + core')):
+    for method, color, marker, label in (('aggregate_only', '#b04a32', 'o', 'Aggregate only'), ('joint', '#236f92', 's', 'Joint')):
         rr = [r for r in rows if r['method'] == method]
         x = np.array([100 * r['w'] for r in rr])
         y = np.array([r['false_activation_rate'] for r in rr])
@@ -431,11 +701,15 @@ def rq2_main(argv=None):
     ap.add_argument('--gradient-seed', type=int, default=20260923)
     ap.add_argument('--ai-seed', type=int, default=20260930)
     ap.add_argument('--ai-training-tasks', type=int, default=4000)
+    ap.add_argument('--workers',type=int,default=1)
+    ap.add_argument('--gradient-only',action='store_true')
     args = ap.parse_args(argv)
     if not (args.replicates > 0 and args.horizon > 2 and (0 < args.delta < 1) and (0 < args.threshold < 1) and (0 < args.core_threshold < 1) and (0 <= args.p_core <= 1) and (0 <= args.p_other <= 1) and all((0 < w < 1 for w in args.shares))):
         ap.error('invalid experiment parameter')
     args.out.mkdir(parents=True, exist_ok=True)
     proposer = AggregateAIProposer(args.ai_seed, args.ai_training_tasks)
+    if args.gradient_only:
+        rq2_gradient(args,proposer); return
     audit, audit_records = rq2_proposer_audit(proposer, args.ai_seed)
     with (args.out / 'proposer_audit.csv').open('w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=list(audit_records[0]))
@@ -465,20 +739,20 @@ def rq2_main(argv=None):
             r'$p^{\mathrm{core}}<\lambda_{\mathrm{core}}$; brackets give Wilson 95\% intervals.}'),
            r'\label{tab:rq2-masked-core}', r'\begin{tabular}{@{}lrrrr@{}}',
            r'\toprule',
-           r'$w$ & Certification rule & Below core & Wilson 95\% & Median event \\',
+           r'$w$ & Certification rule & Below-core & Wilson 95\% & \shortstack{Median decision\\index} \\',
            r'\midrule']
     for row in rows:
-        gov = 'Aggregate only' if row['method'] == 'aggregate_only' else 'Aggregate + core'
+        gov = 'Aggregate only' if row['method'] == 'aggregate_only' else 'Joint'
         interval = f"[{100*row['wilson95_low']:.1f}, {100*row['wilson95_high']:.1f}]"
         tex.append(f"{row['w']:.2f} & {gov} & {row['false_activations']}/{row['replicates']} & "
                    f"{interval} & {_fmt(row['median_decision_event'])} \\\\")
     tex.extend([r'\bottomrule', r'\end{tabular}', r'\end{table}'])
     (args.out / 'table_rq2.tex').write_text('\n'.join(tex) + '\n')
     audit_tex = [r'\begin{table}[t]', r'\centering', r'\small',
-                 r'\caption{Independent ranking audit of the frozen RQ2 proposer.}',
+                 r'\caption{Independent top-choice audit of the frozen RQ2 proposer.}',
                  r'\label{tab:rq2-proposer-audit}',
                  r'\begin{tabular}{@{}rrrr@{}}', r'\toprule',
-                 r'Tasks & Exact rankings & Ranking errors & Mean margin regret \\',
+                 r'Tasks & Optimal choices & Other choices & Mean margin regret \\',
                  r'\midrule',
                  f"{audit['tasks']} & {audit['exact']} & {audit['errors']} & "
                  f"{audit['mean_regret']:.4f} \\\\",
@@ -503,21 +777,35 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+def rq2_worker_init(proposer):
+    global _RQ2_WORKER_PROPOSER
+    _RQ2_WORKER_PROPOSER=proposer
+
+def rq2_gradient_job(job):
+    rep,seed,pc,args=job
+    c,b=rq2_stream(seed,args.gradient_horizon,args.gradient_w,pc,1.0)
+    keep,score=rq2_ai_select(seed,args.gradient_w,pc,1.0,args.threshold,_RQ2_WORKER_PROPOSER)
+    return [rq2_run_method(c,b,m,args.gradient_w,rep,seed,args.gradient_horizon,
+            args.delta,args.threshold,args.core_threshold,pc,keep,score)
+            for m in ('aggregate_only','joint')]
+
 def rq2_gradient(args, proposer):
     args.out.mkdir(parents=True, exist_ok=True)
     rows = []
+    all_gradient_runs = []
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+    rq2_worker_init(proposer)
+    executor=(ProcessPoolExecutor(max_workers=args.workers,
+              mp_context=multiprocessing.get_context('spawn'),
+              initializer=rq2_worker_init,initargs=(proposer,)) if args.workers>1 else None)
     for pi, pc in enumerate(args.gradient_p_core):
         runs = []
-        for rep in range(args.gradient_replicates):
-            seed = args.gradient_seed + pi * 1000000 + rep
-            c, b = rq2_stream(seed, args.gradient_horizon, args.gradient_w, pc, 1.0)
-            ai_keep, ai_score = rq2_ai_select(
-                seed, args.gradient_w, pc, 1.0, args.threshold, proposer)
-            for m in ('aggregate_only', 'joint'):
-                runs.append(rq2_run_method(c, b, m, args.gradient_w, rep, seed, args.gradient_horizon,
-                                           args.delta, args.threshold,
-                                           args.core_threshold, pc,
-                                           ai_keep, ai_score))
+        jobs=[(rep,args.gradient_seed+pi*1000000+rep,pc,args)
+              for rep in range(args.gradient_replicates)]
+        pairs=executor.map(rq2_gradient_job,jobs) if executor else map(rq2_gradient_job,jobs)
+        for pair in pairs:runs.extend(pair)
+        all_gradient_runs.extend(vars(x) | {'p_core': pc} for x in runs)
         for m in ('aggregate_only', 'joint'):
             r = [x for x in runs if x.method == m]
             yes = [x for x in r if x.activated]
@@ -534,6 +822,9 @@ def rq2_gradient(args, proposer):
         print(f"p_core={pc:.2f}  aggregate {rows[-2]['activations']}/{args.gradient_replicates}  "
               f"joint {rows[-1]['activations']}/{args.gradient_replicates}  "
               f"joint median core obligations {rows[-1]['median_core_at_decision']}")
+    if executor:executor.shutdown()
+    with (args.out / 'gradient_runs.csv').open('w', newline='') as f:
+        wtr = csv.DictWriter(f, fieldnames=list(all_gradient_runs[0])); wtr.writeheader(); wtr.writerows(all_gradient_runs)
     with (args.out / 'table_rq2_gradient.csv').open('w', newline='') as f:
         wtr = csv.DictWriter(f, fieldnames=list(rows[0])); wtr.writeheader(); wtr.writerows(rows)
     tex = [r'\begin{table}[t]', r'\centering', r'\small',
@@ -541,7 +832,7 @@ def rq2_gradient(args, proposer):
             r'that no run activated within the horizon.}'),
            r'\label{tab:rq2-gradient}', r'\begin{tabular}{@{}lrrrr@{}}',
            r'\toprule',
-           r'$p^{\mathrm{core}}$ & Aggregate-only activations & Joint activations & Joint median core $q$ & Joint censored \\',
+           r'$p^{\mathrm{core}}$ & \shortstack{Aggregate-only\\activations} & \shortstack{Joint\\activations} & \shortstack{Joint median\\core $q$} & \shortstack{Joint\\censored} \\',
            r'\midrule']
     for pc in args.gradient_p_core:
         agg = next(r for r in rows if r['p_core'] == pc and r['method'] == 'aggregate_only')
@@ -553,7 +844,7 @@ def rq2_gradient(args, proposer):
     (args.out / 'table_rq2_gradient.tex').write_text('\n'.join(tex) + '\n')
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.4))
     for m, lab, mk in (('aggregate_only', 'aggregate-only', 'o'),
-                       ('joint', 'joint (aggregate + core)', 's')):
+                       ('joint', 'joint certification', 's')):
         rr = [r for r in rows if r['method'] == m]
         x = [r['p_core'] for r in rr]
         ax[0].plot(x, [r['activations'] / r['replicates'] for r in rr], marker=mk, label=lab)
@@ -602,12 +893,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def rq3_lower(successes, count, budget):
-    """Same time-uniform one-sided Hoeffding bound as Section 5."""
-    if not count or budget <= 0:
-        return 0.0
-    radius = math.sqrt(math.log(math.pi ** 2 * count ** 2 / (6 * budget)) / (2 * count))
-    return max(0.0, successes / count - radius)
 
 def rq3_stream(seed, horizon, w, regime_edges, p_core_schedule, p_other):
     """A at indices 3,6,...; C protected; response to origin k observed at k+1.
@@ -660,11 +945,11 @@ class rq3_Run:
     activations: int
     final_lambda: float
     final_protected_prob: float
-    sample_target_unsupported_activations: int
+    oracle_composition_unsupported_activations: int
     current_regime_below_core_activations: int
     trigger_restricted: bool
     core_dropped: bool
-    ai_proposals: int
+    ai_selections: int
 
 def rq3_two_window(outcomes, h, eps):
     """Deterministic two-window drift declaration of Section 6."""
@@ -674,142 +959,67 @@ def rq3_two_window(outcomes, h, eps):
     curr = sum(outcomes[-h:]) / h
     return prev - curr >= eps
 
-def rq3_origin_version_outcome(response_ok, adaptive_ok, origin_require_adaptive):
-    """Evaluate a completed incumbent obligation under its origin version."""
-    return int(response_ok) and (1 if (not origin_require_adaptive or adaptive_ok) else 0)
 
-def rq3_test_origin_version_semantics():
-    """A revision between origin and completion must not change the outcome."""
-    old_requires_adaptive = True
-    new_requires_adaptive = False
-    response_ok, adaptive_ok = True, False
-    origin_value = rq3_origin_version_outcome(
-        response_ok, adaptive_ok, old_requires_adaptive)
-    retroactive_value = rq3_origin_version_outcome(
-        response_ok, adaptive_ok, new_requires_adaptive)
-    assert origin_value == 0 and retroactive_value == 1
 
-def rq3_run_history(protected, response, p_core_at, governor, rep, seed, args,
-                    proposer):
-    """One execution: repeated detect -> propose -> certify -> activate.
-
-    Certification counters are maintained incrementally, so the cost per event
-    is constant and independent of the number of completed obligations.
-    """
-    rng = np.random.default_rng(seed + 997)
-    adaptive_ok = rng.random(len(protected)) < args.p_adaptive
-    horizon = args.horizon
-    delta = args.delta
-    lam = args.lam0
-    keep_adaptive, require_adaptive = True, True
-    j = 0
-    activations = 0
-    sample_target_unsupported = 0
-    current_regime_below_core = 0
-    ai_proposals = 0
-    incumbent_outcomes = []
-    prefix_origins = []
-    state = 'monitor'
-    cand = None
-    n_all = s_all = n_core = s_core = 0
-    budget_all = budget_core = 0.0
-    trace = []
-    origin_keep = {}
-    origin_require = {}
-    mu_all_sum = mu_core_sum = 0.0
-    for n in range(horizon + 1):
-        # Record the active version at origin. A decision at n activates its
-        # successor only at n+1 and cannot reinterpret this obligation.
-        if n > 0 and n % 3 == 0:
-            origin_keep[n] = keep_adaptive
-            origin_require[n] = require_adaptive
-        if n >= 2:
-            k = n - 2
-            if k > 0 and k % 3 == 0:
-                prefix_origins.append(k)
-                k_keep = origin_keep[k]
-                k_require = origin_require[k]
-                if k_keep or protected[k]:
-                    x = rq3_origin_version_outcome(
-                        response[k + 1], adaptive_ok[k], k_require)
-                    incumbent_outcomes.append(x)
-                    if len(incumbent_outcomes) > 4 * args.window:
-                        del incumbent_outcomes[:args.window]
-                if state == 'certify':
-                    c_lam, c_keep, c_req = cand
-                    if c_keep or protected[k]:
-                        xc = int(response[k + 1]) and (1 if (not c_req or adaptive_ok[k]) else 0)
-                        n_all += 1; s_all += xc
-                        mu = (float(p_core_at[k]) if protected[k] else args.p_other)
-                        if c_req:
-                            mu *= args.p_adaptive
-                        mu_all_sum += mu
-                        if protected[k]:
-                            n_core += 1; s_core += xc
-                            mu_core_sum += mu
-        if state == 'certify' and n_all:
-            c_lam, c_keep, c_req = cand
-            pass_all = rq3_lower(s_all, n_all, budget_all) >= c_lam
-            pass_core = True if governor == 'aggregate_only' else (
-                n_core > 0 and rq3_lower(s_core, n_core, budget_core) >= args.core_threshold)
-            if pass_all and pass_core:
-                sample_bad = (mu_all_sum / n_all < c_lam)
-                if governor == 'joint':
-                    sample_bad = sample_bad or (
-                        n_core > 0 and mu_core_sum / n_core < args.core_threshold)
-                lam, keep_adaptive, require_adaptive = cand
-                activations += 1
-                if sample_bad:
-                    sample_target_unsupported += 1
-                if p_core_at[n] < args.core_threshold:
-                    current_regime_below_core += 1
-                j += 1
-                state = 'monitor'
-                incumbent_outcomes = []
-                n_all = s_all = n_core = s_core = 0
-                mu_all_sum = mu_core_sum = 0.0
-        if state == 'monitor' and rq3_two_window(incumbent_outcomes, args.window, args.margin):
-            best, best_score = None, -1.0
-            recent = prefix_origins[-args.prefix:]
-            if recent:
-                ones = np.ones(len(protected), dtype=bool)
-                for c_lam, c_keep, c_req in rq3_candidates(args.envelope):
-                    if (c_lam, c_keep, c_req) == (lam, keep_adaptive, require_adaptive):
-                        continue
-                    structural_changes = int(c_keep != keep_adaptive) + int(c_req != require_adaptive)
-                    if structural_changes > 1:
-                        continue
-                    a_n, a_s, c_n, c_s = rq3_group_counts(
-                        protected, response, recent, c_keep,
-                        adaptive_ok if c_req else ones)
-                    if a_n == 0:
-                        continue
-                    margin = a_s / a_n - c_lam
-                    if margin <= 0:
-                        continue
-                    coverage = a_n / len(recent)
-                    score = proposer.predict_margin(
-                        a_s / a_n, coverage, c_lam, c_keep, c_req)
-                    if score > best_score:
-                        best, best_score = (c_lam, c_keep, c_req), score
-            if best is not None:
-                cand = best
-                ai_proposals += 1
-                delta_j = delta / (2 ** (j + 1))
-                if governor == 'aggregate_only':
-                    budget_all, budget_core = delta_j, 0.0
-                else:
-                    budget_all = budget_core = delta_j / 2
-                state = 'certify'
-                n_all = s_all = n_core = s_core = 0
-                mu_all_sum = mu_core_sum = 0.0
-            else:
-                incumbent_outcomes = []
-        if n % 3000 == 0:
-            trace.append((n, float(p_core_at[n])))
-    return rq3_Run(governor, rep, seed, activations, lam, float(p_core_at[horizon]),
-                   sample_target_unsupported, current_regime_below_core,
-                   not keep_adaptive, not require_adaptive, ai_proposals), trace
+def rq3_run_history(protected, response, p_core_at, governor, rep, seed, args, proposer):
+    rng=np.random.default_rng(seed+997)
+    adaptive_ok=rng.random(len(protected))<args.p_adaptive
+    masks=event_masks(protected,response,adaptive_ok)
+    initial=specification(args.lam0,True,True)
+    env={(x,1,1) for x in args.envelope}
+    g=Governor(initial,env,args.delta,governor=='joint',args.core_threshold)
+    incumbent_outcomes=[];prefix_origins=[];trace=[]
+    mu_all=mu_core=0.;n_all=n_core=0
+    oracle_bad=regime_bad=0
+    pending_oracle_bad=False
+    last_version=0
+    neighborhood=[specification(lam,keep,req) for lam,keep,req in rq3_candidates(args.envelope)]
+    ones=np.ones(len(protected),dtype=bool)
+    for n,v in enumerate(masks):
+        op,cert=g.advance(n,n,int(v))
+        if g.version!=last_version:
+            oracle_bad+=int(pending_oracle_bad)
+            regime_bad+=int(p_core_at[n]<args.core_threshold)
+            incumbent_outcomes=[];last_version=g.version
+        incumbent_outcomes.extend(x.outcome for x in op if x.version==g.version)
+        if len(incumbent_outcomes)>4*args.window:del incumbent_outcomes[:-3*args.window]
+        # All A opportunities complete at k+2 in the [1,1] candidate family.
+        k=n-2
+        if k>0 and k%3==0:
+            prefix_origins.append(k)
+            if len(prefix_origins)>args.prefix:del prefix_origins[0]
+        for x in cert:
+            # Descriptive oracle for realised group/origin, not the theorem estimand.
+            mu=float(p_core_at[x.origin]) if x.core else args.p_other
+            if x.specification.adaptive_response!=TOP:mu*=args.p_adaptive
+            mu_all+=mu;n_all+=1
+            if x.core:mu_core+=mu;n_core+=1
+        if g.decisions and g.decisions[-1]['index']==n:
+            d=g.decisions[-1]
+            bad=mu_all/n_all<d['specification'].threshold
+            if governor=='joint':bad=bad or mu_core/n_core<args.core_threshold
+            pending_oracle_bad=bad
+        if not g.attempted and rq3_two_window(incumbent_outcomes,args.window,args.margin):
+            candidates=[];features=[]
+            for spec in neighborhood:
+                if not g.admissible(spec):continue
+                keep=spec.adaptive_trigger!=BOTTOM;req=spec.adaptive_response!=TOP
+                an,ass,cn,cs=rq3_group_counts(protected,response,prefix_origins,keep,
+                                             adaptive_ok if req else ones)
+                if an==0 or ass/an<=spec.threshold:continue
+                candidates.append(spec)
+                features.append([ass/an,an/len(prefix_origins),spec.threshold,float(keep),float(req)])
+            if candidates:
+                scores=proposer.model.predict(np.asarray(features))
+                best=int(np.argmax(scores))
+                assert g.select(candidates[best],n,True)
+                mu_all=mu_core=0.;n_all=n_core=0
+            else:incumbent_outcomes=[]
+        if n%3000==0:trace.append((n,float(p_core_at[n])))
+    spec=g.active.spec
+    return rq3_Run(governor,rep,seed,len(g.activations),spec.threshold,float(p_core_at[-1]),
+                   oracle_bad,regime_bad,spec.adaptive_trigger==BOTTOM,
+                   spec.adaptive_response==TOP,len(g.selections)),trace
 
 def rq3_wilson(k, n, z=1.959963984540054):
     if n == 0:
@@ -840,7 +1050,7 @@ def rq3_main(argv):
     ap.add_argument('--ai-training-tasks', type=int, default=4000)
     ap.add_argument('--seed', type=int, default=20260924)
     args = ap.parse_args(argv)
-    rq3_test_origin_version_semantics()
+    protocol_tests()
     args.out.mkdir(parents=True, exist_ok=True)
     proposer = AggregateAIProposer(args.ai_seed, args.ai_training_tasks)
     edges = [int((i + 1) * args.horizon / len(args.p_core_schedule))
@@ -858,45 +1068,47 @@ def rq3_main(argv):
     rows = []
     for gov in ('aggregate_only', 'joint'):
         rr = [r for r in runs if r.governor == gov]
-        k = sum(r.sample_target_unsupported_activations > 0 for r in rr)
+        k = sum(r.oracle_composition_unsupported_activations > 0 for r in rr)
         k_regime = sum(r.current_regime_below_core_activations > 0 for r in rr)
         lo, hi = rq3_wilson(k, len(rr))
         rows.append(dict(
             governor=gov, replicates=len(rr),
             mean_activations=float(np.mean([r.activations for r in rr])),
             max_activations=int(np.max([r.activations for r in rr])),
-            runs_with_sample_target_unsupported_activation=k,
-            sample_target_unsupported_rate=k / len(rr),
-            sample_target_wilson95_low=lo, sample_target_wilson95_high=hi,
+            runs_with_oracle_composition_unsupported_activation=k,
+            oracle_composition_unsupported_rate=k / len(rr),
+            oracle_composition_wilson95_low=lo, oracle_composition_wilson95_high=hi,
             runs_with_current_regime_below_core_activation=k_regime,
             current_regime_below_core_rate=k_regime / len(rr),
-            mean_sample_target_unsupported_activations=float(np.mean([
-                r.sample_target_unsupported_activations for r in rr])),
+            mean_oracle_composition_unsupported_activations=float(np.mean([
+                r.oracle_composition_unsupported_activations for r in rr])),
             mean_current_regime_below_core_activations=float(np.mean([
                 r.current_regime_below_core_activations for r in rr])),
             median_final_lambda=float(np.median([r.final_lambda for r in rr])),
             runs_trigger_restricted=sum(r.trigger_restricted for r in rr),
             runs_core_only_response=sum(r.core_dropped for r in rr),
-            mean_ai_proposals=float(np.mean([r.ai_proposals for r in rr])),
+            mean_ai_selections=float(np.mean([r.ai_selections for r in rr])),
             horizon=args.horizon, w=args.w))
     for name, data in (('runs.csv', [vars(r) for r in runs]), ('table_rq3.csv', rows)):
         with (args.out / name).open('w', newline='') as f:
             wtr = csv.DictWriter(f, fieldnames=list(data[0])); wtr.writeheader(); wtr.writerows(data)
     tex = [r'\begin{table}[t]', r'\centering', r'\small',
            (r'\caption{RQ3 sequential experiment with the frozen supervised AI '
-            r"proposer. `Below core' counts runs with at least one activation "
-            r'during a regime where $p^{\mathrm{core}}<\lambda_{\mathrm{core}}$.}'),
-           r'\label{tab:rq3-sequential}', r'\resizebox{\linewidth}{!}{%',
+            r"proposer. `Below-core' counts runs with at least one activation "
+            r'during a regime where $p^{\mathrm{core}}<\lambda_{\mathrm{core}}$. '
+            r'The oracle-composition column counts histories with at least one activation below the descriptive sample diagnostic defined in the text; it does '
+            r'not count the theorem failure event.}'),
+           r'\label{tab:rq3-sequential}', 
            r'\begin{tabular}{@{}lrrrr@{}}',
            r'\toprule',
-           r'Certification rule & Mean activations & Mean proposals & Below core & Sample-target failure \\',
+           r'Rule & \shortstack{Mean\\activations} & \shortstack{Mean\\selections} & Below-core & \shortstack{Oracle\\composition} \\',
            r'\midrule']
     for row in rows:
-        gov = 'Aggregate only' if row['governor'] == 'aggregate_only' else 'Aggregate + core'
-        tex.append(f"{gov} & {row['mean_activations']:.2f} & {row['mean_ai_proposals']:.2f} & "
+        gov = 'Aggregate only' if row['governor'] == 'aggregate_only' else 'Joint'
+        tex.append(f"{gov} & {row['mean_activations']:.2f} & {row['mean_ai_selections']:.2f} & "
                    f"{row['runs_with_current_regime_below_core_activation']}/{row['replicates']} & "
-                   f"{row['runs_with_sample_target_unsupported_activation']}/{row['replicates']} \\\\")
-    tex.extend([r'\bottomrule', r'\end{tabular}}', r'\end{table}'])
+                   f"{row['runs_with_oracle_composition_unsupported_activation']}/{row['replicates']} \\\\")
+    tex.extend([r'\bottomrule', r'\end{tabular}', r'\end{table}'])
     (args.out / 'table_rq3.tex').write_text('\n'.join(tex) + '\n')
     fig, ax = plt.subplots(1, 2, figsize=(9, 3.4))
     labels = {'aggregate_only': 'aggregate-only governor', 'joint': 'joint governor'}
@@ -922,7 +1134,7 @@ def rq3_main(argv):
     print(f'Saved {len(runs)} runs to {args.out}')
     for r in rows:
         print(f"{r['governor']:15s}: activations {r['mean_activations']:.2f} mean, "
-              f"sample-target unsupported in {r['runs_with_sample_target_unsupported_activation']}/{r['replicates']} runs, "
+              f"oracle-composition unsupported in {r['runs_with_oracle_composition_unsupported_activation']}/{r['replicates']} runs, "
               f"current-regime below core in {r['runs_with_current_regime_below_core_activation']}/{r['replicates']} runs, "
               f"median final lambda {r['median_final_lambda']}")
 
@@ -956,44 +1168,10 @@ def case_make_trace(seed: int, triggers: int, protected_share: float,
     return alarm, critical, intervention, origins
 
 
-def case_monitor(intervention: np.ndarray, origins: np.ndarray,
-                 lower: int, upper: int) -> np.ndarray:
-    """Evaluate A -> eventually_[lower,upper] B at the supplied origins."""
-    return np.fromiter(
-        (bool(intervention[k + lower:k + upper + 1].any()) for k in origins),
-        dtype=bool, count=len(origins))
 
 
-def case_first_activation(outcomes, groups, threshold, core_threshold,
-                          delta_j, joint):
-    all_success = core_success = core_count = 0
-    all_budget = delta_j / 2 if joint else delta_j
-    core_budget = delta_j / 2
-    for q, (x, is_core) in enumerate(zip(outcomes, groups), start=1):
-        all_success += int(x)
-        if is_core:
-            core_count += 1
-            core_success += int(x)
-        all_ok = rq2_lower(all_success, q, all_budget) >= threshold
-        core_ok = (not joint or
-                   (core_count > 0 and
-                    rq2_lower(core_success, core_count, core_budget) >= core_threshold))
-        if all_ok and core_ok:
-            return q, core_count
-    return None, core_count
 
 
-def case_peak_pending(origins: np.ndarray, upper: int) -> int:
-    """Maximum unresolved obligations for one bounded-response monitor."""
-    changes = []
-    for k in origins:
-        changes.append((int(k), 1))
-        changes.append((int(k + upper + 1), -1))
-    pending = peak = 0
-    for _, change in sorted(changes, key=lambda z: (z[0], z[1])):
-        pending += change
-        peak = max(peak, pending)
-    return peak
 
 
 def case_peak_bytes(callable_):
@@ -1004,139 +1182,169 @@ def case_peak_bytes(callable_):
     return result, peak
 
 
+def case_write_ranking_table(audit, output):
+    tex=[r'\begin{table}[t]',r'\centering',r'\small',
+        r'\caption{Case-study proposal pool and frozen AI scores on the selection prefix. The selected candidate is marked with an asterisk. The inadmissible candidate is not scored.}',
+        r'\label{tab:case-candidates}',r'\begin{tabular}{@{}llllr@{}}',r'\toprule',
+        r'Trigger & Response & Window & Structural check & Predicted margin \\',r'\midrule']
+    for row in audit:
+        legal=str(row['admissible']).lower()=='true'
+        full=str(row['full_trigger']).lower()=='true'
+        selected=str(row['selected']).lower()=='true'
+        score=f"{float(row['predicted_margin']):.4f}" if row['predicted_margin']!='' else '--'
+        tex.append(('$A$' if full else r'$A\land C$')+' & '+('$B$' if legal else r'$\top$')+
+            ' & $'+row['window']+('^{*}' if selected else '')+'$ & '+
+            ('admissible' if legal else 'rejected')+' & '+score+r' \\')
+    tex.extend([r'\bottomrule',r'\end{tabular}',r'\end{table}'])
+    (output/'table_case_candidates.tex').write_text('\n'.join(tex)+'\n')
+
 def case_main(argv=None):
-    ap = argparse.ArgumentParser(description='Clinical-alarm monitored case study')
-    ap.add_argument('--out', type=Path, required=True)
-    ap.add_argument('--triggers', type=int, default=30000)
-    ap.add_argument('--prefix', type=int, default=1000)
-    ap.add_argument('--protected-share', type=float, default=0.10)
-    ap.add_argument('--p-core', type=float, default=0.60)
-    ap.add_argument('--p-other', type=float, default=0.99)
-    ap.add_argument('--threshold', type=float, default=0.90)
-    ap.add_argument('--core-threshold', type=float, default=0.90)
-    ap.add_argument('--delta-j', type=float, default=0.025)
-    ap.add_argument('--repetitions', type=int, default=9)
-    ap.add_argument('--seed', type=int, default=20260924)
-    ap.add_argument('--ai-seed', type=int, default=20260930)
-    args = ap.parse_args(argv)
-    args.out.mkdir(parents=True, exist_ok=True)
-
-    alarm, critical, intervention, origins = case_make_trace(
-        args.seed, args.triggers, args.protected_share,
-        args.p_core, args.p_other)
-    groups = critical[origins]
-    candidate_outcomes = case_monitor(intervention, origins, 1, 8)
-    incumbent_outcomes = case_monitor(intervention, origins, 1, 3)
-
-    # A frozen learned proposer ranks the structurally admissible widened
-    # response window from prefix aggregate evidence. A second proposal that
-    # drops protected response B is rejected before ranking.
-    proposer = AggregateAIProposer(args.ai_seed, 4000)
-    prefix_rate = float(candidate_outcomes[:args.prefix].mean())
-    predicted_margin = proposer.predict_margin(
-        prefix_rate, 1.0, args.threshold, True, False)
-    selected_window = '[1,8]' if predicted_margin >= 0 else '[1,3]'
-    if selected_window != '[1,8]':
-        raise RuntimeError('Frozen proposer did not select the manuscript candidate')
-
-    post = candidate_outcomes[args.prefix:]
-    post_groups = groups[args.prefix:]
-    aggregate_q, aggregate_core_q = case_first_activation(
-        post, post_groups, args.threshold, args.core_threshold,
-        args.delta_j, False)
-    joint_q, joint_core_q = case_first_activation(
-        post, post_groups, args.threshold, args.core_threshold,
-        args.delta_j, True)
-
-    # Explicit pending-obligation regression: the origin version owns [1,8].
-    pending = np.zeros(12, dtype=bool)
-    pending[6] = True
-    origin_version_outcome = int(pending[1:9].any())
-    retroactive_short_window = int(pending[1:4].any())
+    import json, platform, sys, importlib.metadata
+    ap=argparse.ArgumentParser(description='Incremental monitored synthetic alarm case')
+    for flag,typ,default in [('triggers',int,30000),('prefix',int,1000),
+        ('protected-share',float,.1),('p-core',float,.6),('p-other',float,.99),
+        ('threshold',float,.9),('core-threshold',float,.9),('delta-j',float,.025),
+        ('repetitions',int,9),('seed',int,20260924),('ai-seed',int,20260930)]:
+        ap.add_argument('--'+flag,type=typ,default=default)
+    ap.add_argument('--out',type=Path,required=True)
+    args=ap.parse_args(argv);args.out.mkdir(parents=True,exist_ok=True)
+    if args.triggers<2:raise ValueError('at least two alarms are required')
+    prefix=min(args.prefix,args.triggers//2)
+    alarm,critical,intervention,origins=case_make_trace(args.seed,args.triggers,
+        args.protected_share,args.p_core,args.p_other)
+    masks=alarm.astype(np.uint8)|critical.astype(np.uint8)*2|intervention.astype(np.uint8)*4
+    incumbent=specification(args.threshold,upper=3)
+    env={(args.threshold,1,b) for b in (3,4,6,8)}
+    # Fixed proposal grammar plus an explicitly injected protected-response fault.
+    # Model ranking is learned; syntactic protection is enforced by the governor.
+    pool=[specification(args.threshold,upper=b) for b in (4,6,8)]
+    pool.append(specification(args.threshold,keep=False,upper=8))
+    pool.append(replace(pool[2],core_response=TOP))
+    legal=[];audit=[]
+    for i,cand in enumerate(pool):
+        reasons=revision_rejections(incumbent,cand,env)
+        audit.append(dict(candidate=i,window=f'[{cand.lower},{cand.upper}]',
+            full_trigger=cand.adaptive_trigger!=BOTTOM,admissible=not reasons,
+            rejection=';'.join(reasons),prefix_count=0,prefix_frequency='',predicted_margin='',selected=False))
+        if not reasons:legal.append((i,cand,IncrementalMonitor(cand)))
+    nstar=int(origins[prefix-1]+8+1)
+    counts={i:[0,0,0,0] for i,_,_ in legal}
+    for n in range(nstar+1):
+        for i,_,mon in legal:
+            for x in mon.advance(n,n,int(masks[n])):
+                c=counts[i];c[0]+=1;c[1]+=x.outcome
+                if x.core:c[2]+=1;c[3]+=x.outcome
+    proposer=AggregateAIProposer(args.ai_seed,4000)
+    features=[];eligible=[]
+    for i,cand,_ in legal:
+        nn,ss,nc,sc=counts[i]
+        if nn:
+            features.append([ss/nn,nn/prefix,args.threshold,
+                             float(cand.adaptive_trigger!=BOTTOM),0.])
+            eligible.append((i,cand))
+            audit[i].update(prefix_count=nn,prefix_frequency=ss/nn)
+    scores=proposer.model.predict(np.asarray(features))
+    for (i,_),score in zip(eligible,scores):audit[i]['predicted_margin']=float(score)
+    selected_pos=int(np.argmax(scores));chosen_index,chosen=eligible[selected_pos]
+    audit[chosen_index]['selected']=True
+    with (args.out/'candidate_ranking.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(audit[0]));w.writeheader();w.writerows(audit)
+    case_write_ranking_table(audit,args.out)
 
     def baseline_run():
-        return case_monitor(intervention, origins, 1, 3)
+        mon=IncrementalMonitor(incumbent);nall=sall=0
+        for n,v in enumerate(masks):
+            for x in mon.advance(n,n,int(v)):nall+=1;sall+=x.outcome
+        return dict(n=nall,s=sall,peak_pending=mon.peak_pending)
 
-    def governed_run():
-        operational = case_monitor(intervention, origins, 1, 3)
-        certification = case_monitor(intervention, origins, 1, 8)
-        decision = case_first_activation(
-            certification[args.prefix:], post_groups, args.threshold,
-            args.core_threshold, args.delta_j, True)
-        return operational, certification, decision
+    def governed_run(joint=True):
+        gov=Governor(incumbent,env,2*args.delta_j,joint,args.core_threshold)
+        evidence=None
+        for n,v in enumerate(masks):
+            gov.advance(n,n,int(v))
+            if n==nstar:
+                # All untrusted outputs go through the same executable check.
+                for cand in pool:
+                    reasons=revision_rejections(gov.active.spec,cand,gov.envelope)
+                    if reasons:gov.rejections.append((n,reasons))
+                assert gov.select(chosen,n,True)
+                evidence=gov.evidence
+        return gov,evidence
 
-    baseline_times, governed_times = [], []
-    for _ in range(args.repetitions):
-        tic = time.perf_counter()
-        _ = baseline_run()
-        baseline_times.append(time.perf_counter() - tic)
-        tic = time.perf_counter()
-        _ = governed_run()
-        governed_times.append(time.perf_counter() - tic)
-    _, baseline_peak_bytes = case_peak_bytes(baseline_run)
-    _, governed_peak_bytes = case_peak_bytes(governed_run)
-    baseline_ms = 1000 * float(np.median(baseline_times))
-    governed_ms = 1000 * float(np.median(governed_times))
-    overhead = governed_ms / baseline_ms
-    trace_events = len(alarm)
-    baseline_us_per_event = 1000 * baseline_ms / trace_events
-    governed_us_per_event = 1000 * governed_ms / trace_events
-    baseline_peak_pending = case_peak_pending(origins, 3)
-    governed_peak_pending = baseline_peak_pending + case_peak_pending(origins, 8)
-
-    row = dict(
-        triggers=args.triggers,
-        protected_share=float(groups.mean()),
-        incumbent_success=float(incumbent_outcomes.mean()),
-        candidate_success=float(candidate_outcomes.mean()),
-        candidate_core_success=float(candidate_outcomes[groups].mean()),
-        ai_predicted_margin=predicted_margin,
-        structurally_rejected_candidates=1,
-        selected_window=selected_window,
-        aggregate_activation_completed=aggregate_q,
-        joint_activation_completed=joint_q or '',
-        joint_final_core_completed=joint_core_q,
-        origin_version_outcome=origin_version_outcome,
-        retroactive_short_window_outcome=retroactive_short_window,
-        baseline_median_ms=baseline_ms,
-        governed_median_ms=governed_ms,
-        baseline_us_per_event=baseline_us_per_event,
-        governed_us_per_event=governed_us_per_event,
-        baseline_peak_kib=baseline_peak_bytes / 1024,
-        governed_peak_kib=governed_peak_bytes / 1024,
-        baseline_peak_pending=baseline_peak_pending,
-        governed_peak_pending=governed_peak_pending,
-        parallel_monitor_increment_ms=governed_ms - baseline_ms,
-        overhead_ratio=overhead)
-    with (args.out / 'case_study.csv').open('w', newline='') as f:
-        wtr = csv.DictWriter(f, fieldnames=list(row)); wtr.writeheader(); wtr.writerow(row)
-
-    agg_text = f'{aggregate_q:,}' if aggregate_q is not None else '--'
-    joint_text = f'{joint_q:,}' if joint_q is not None else 'not activated'
-    tex = [
-        r'\begin{table}[t]', r'\centering', r'\small',
-        r'\caption{Monitored clinical-alarm case study and reference runtime.}',
-        r'\label{tab:clinical-case}',
-        r'\resizebox{\linewidth}{!}{%',
-        r'\begin{tabular}{@{}lr@{}}', r'\toprule',
-        r'Quantity & Result \\', r'\midrule',
-        f'Completed alarm obligations & {args.triggers:,} \\\\',
-        f'Observed protected share & {groups.mean():.3f} \\\\',
-        f'Candidate aggregate success & {candidate_outcomes.mean():.3f} \\\\',
-        f'Candidate protected success & {candidate_outcomes[groups].mean():.3f} \\\\',
-        f'Aggregate-only activation sample & {agg_text} \\\\',
-        f'Joint activation & {joint_text} \\\\',
-        f'Pending outcome: origin / retroactive & {origin_version_outcome} / {retroactive_short_window} \\\\',
-        f'Baseline / governed median runtime & {baseline_ms:.1f} / {governed_ms:.1f} ms \\\\',
-        f'Baseline / governed time per event & {baseline_us_per_event:.3f} / {governed_us_per_event:.3f} $\\mu$s \\\\',
-        f'Baseline / governed peak memory & {baseline_peak_bytes/1024:.1f} / {governed_peak_bytes/1024:.1f} KiB \\\\',
-        f'Baseline / governed peak pending & {baseline_peak_pending} / {governed_peak_pending} \\\\',
-        f'Parallel-governor increment & {governed_ms-baseline_ms:.1f} ms \\\\',
-        f'Reference runtime ratio & {overhead:.2f}$\\times$ \\\\',
-        r'\bottomrule', r'\end{tabular}}', r'\end{table}']
-    (args.out / 'table_case.tex').write_text('\n'.join(tex) + '\n')
-    print(f'Saved clinical case study to {args.out}; aggregate={agg_text}, '
-          f'joint={joint_text}, overhead={overhead:.2f}x')
+    aggregate,agg_ev=governed_run(False)
+    joint,joint_ev=governed_run(True)
+    # If joint certification activates, finish the diagnostic candidate monitor
+    # separately, without feeding it into later decisions or reusing the prefix.
+    diag=IncrementalMonitor(chosen)
+    nn=ss=nc=sc=0
+    for n,v in enumerate(masks):
+        for x in diag.advance(n,n,int(v)):
+            nn+=1;ss+=x.outcome
+            if x.core:nc+=1;sc+=x.outcome
+    baseline_times=[];governed_times=[]
+    for rep in range(args.repetitions):
+        # Alternate order to reduce systematic warm-cache/order effects.
+        order=('base','gov') if rep%2==0 else ('gov','base')
+        for kind in order:
+            start=time.perf_counter()
+            result=baseline_run() if kind=='base' else governed_run(True)
+            (baseline_times if kind=='base' else governed_times).append(time.perf_counter()-start)
+    base,base_bytes=case_peak_bytes(baseline_run)
+    (measured,ev),gov_bytes=case_peak_bytes(governed_run)
+    base_ms=1000*float(np.median(baseline_times));gov_ms=1000*float(np.median(governed_times))
+    regression=protocol_tests()
+    row=dict(triggers=args.triggers,selection_prefix=prefix,selection_event=nstar,
+        trace_events=len(masks),protected_share=float(critical[origins].mean()),
+        incumbent_success=base['s']/base['n'],candidate_success=ss/nn,
+        candidate_core_success=sc/nc if nc else '',
+        proposals_generated=len(pool),structurally_rejected_candidates=len(joint.rejections),
+        candidates_ranked=len(eligible),ai_predicted_margin=float(scores[selected_pos]),
+        selected_window=f'[{chosen.lower},{chosen.upper}]',
+        aggregate_activation_completed=aggregate.decisions[0]['n'] if aggregate.decisions else '',
+        aggregate_decision_event=aggregate.decisions[0]['index'] if aggregate.decisions else '',
+        aggregate_activation_event=aggregate.activations[0][0] if aggregate.activations else '',
+        joint_activation_completed=joint.decisions[0]['n'] if joint.decisions else '',
+        joint_final_core_completed=joint_ev.nc,
+        origin_version_outcome=regression['origin_version_outcome'],
+        retroactive_short_window_outcome=regression['retroactive_short_window_outcome'],
+        baseline_median_ms=base_ms,governed_median_ms=gov_ms,
+        baseline_us_per_event=1000*base_ms/len(masks),governed_us_per_event=1000*gov_ms/len(masks),
+        baseline_peak_kib=base_bytes/1024,governed_peak_kib=gov_bytes/1024,
+        baseline_peak_pending=base['peak_pending'],governed_peak_pending=measured.peak_pending,
+        parallel_monitor_increment_ms=gov_ms-base_ms,overhead_ratio=gov_ms/base_ms)
+    with (args.out/'case_study.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(row));w.writeheader();w.writerow(row)
+    metadata=dict(python=sys.version,platform=platform.platform(),processor=platform.processor(),
+        packages={x:importlib.metadata.version(x) for x in ('numpy','scipy','matplotlib','scikit-learn')},
+        arguments=vars(args)|{'out':str(args.out)},timing_repetitions=args.repetitions,
+        timing_excludes=['trace generation','model training','prefix ranking','diagnostic monitor'],
+        peak_memory='tracemalloc allocations during event-loop call; input trace preallocated',
+        baseline_seconds=baseline_times,governed_seconds=governed_times)
+    (args.out/'runtime_environment.json').write_text(json.dumps(metadata,indent=2))
+    (args.out/'protocol_tests.json').write_text(json.dumps(regression,indent=2))
+    results=[('Completed alarm obligations',f'{args.triggers:,}'),
+        ('Observed protected share',f"{row['protected_share']:.3f}"),
+        ('Candidate aggregate frequency',f'{ss/nn:.3f}'),
+        ('Candidate protected frequency',f'{sc/nc:.3f}' if nc else '--'),
+        ('Proposals / structurally rejected / ranked',f"{len(pool)} / {len(joint.rejections)} / {len(eligible)}"),
+        ('Selected response window',row['selected_window']),
+        ('Aggregate-only activation sample',f"{row['aggregate_activation_completed']:,}" if aggregate.decisions else '--'),
+        ('Joint activation','activated' if joint.activations else 'not activated'),
+        ('Pending outcome: origin / retroactive','1 / 0'),
+        ('Baseline / governed median runtime',f'{base_ms:.1f} / {gov_ms:.1f} ms'),
+        ('Baseline / governed mean time per event',f"{row['baseline_us_per_event']:.3f} / {row['governed_us_per_event']:.3f} $\\mu$s"),
+        ('Baseline / governed peak working memory',f'{base_bytes/1024:.1f} / {gov_bytes/1024:.1f} KiB'),
+        ('Baseline / governed peak pending',f"{base['peak_pending']} / {measured.peak_pending}"),
+        ('Parallel-governor increment',f'{gov_ms-base_ms:.1f} ms'),
+        ('Reference runtime ratio',f'{gov_ms/base_ms:.2f}'+r'$\times$')]
+    tex=[r'\begin{table}[t]',r'\centering',r'\small',
+         r'\caption{Incremental monitored alarm case study and reference runtime.}',
+         r'\label{tab:clinical-case}',r'\begin{tabularx}{\linewidth}{@{}Xr@{}}',r'\toprule',
+         r'Quantity & Result \\',r'\midrule']
+    tex.extend(a+' & '+b+r' \\' for a,b in results)
+    tex.extend([r'\bottomrule',r'\end{tabularx}',r'\end{table}'])
+    (args.out/'table_case.tex').write_text('\n'.join(tex)+'\n')
+    print(json.dumps(row,indent=2))
 
 
 def case_cli(argv):
@@ -1145,12 +1353,18 @@ def case_cli(argv):
 def cli():
     import argparse
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('experiment',choices=('rq1','rq2','rq3','case','all'))
+    parser.add_argument('experiment',choices=('rq1','rq2','rq3','case','all','test'))
     parser.add_argument('--out',type=Path,default=Path('results'))
     parser.add_argument('--quick',action='store_true',help='small smoke run, not manuscript numbers')
     args,unknown=parser.parse_known_args()
     runners={'rq1':rq1_cli,'rq2':rq2_cli,'rq3':rq3_cli,'case':case_cli}
-    if args.experiment=='all':
+    if args.experiment=='test':
+        import json
+        args.out.mkdir(parents=True,exist_ok=True)
+        report=protocol_tests()
+        (args.out/'protocol_tests.json').write_text(json.dumps(report,indent=2))
+        print(report)
+    elif args.experiment=='all':
         if unknown:parser.error('experiment-specific flags require one RQ')
         for name,runner in runners.items():
             more={'rq1':['--replicates','2','--max-completed','100'],

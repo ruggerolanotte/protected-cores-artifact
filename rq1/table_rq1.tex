@@ -3,23 +3,22 @@
 \small
 \caption{RQ1 synthetic post-selection certification. Each row has 1000 independent replications and 6,000 completed-obligation opportunities. Wilson intervals measure Monte Carlo variation; $q$ is the median completed count at activation.}
 \label{tab:rq1-certification}
-\resizebox{\linewidth}{!}{%
 \begin{tabular}{@{}llrrrr@{}}
 \toprule
-True $p$ & Procedure & Activations & Wilson 95\% (\%) & Median $q$ & Censored \\
+True $p$ & Procedure & Activations & \shortstack[r]{\shortstack{Wilson 95\%\\(\%)}} & \shortstack[r]{\shortstack{Median\\$q$}} & Censored \\
 \midrule
-0.890 & Direct proposal & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
- & Fixed-time, repeatedly tested & 56/1000 & [4.3, 7.2] & 107 & 944 \\
- & Exact test with spending & 0/1000 & [0.0, 0.4] & -- & 1000 \\
- & Paper's Hoeffding bound & 0/1000 & [0.0, 0.4] & -- & 1000 \\
-0.899 & Direct proposal & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
- & Fixed-time, repeatedly tested & 190/1000 & [16.7, 21.5] & 249 & 810 \\
- & Exact test with spending & 0/1000 & [0.0, 0.4] & -- & 1000 \\
- & Paper's Hoeffding bound & 0/1000 & [0.0, 0.4] & -- & 1000 \\
-0.980 & Direct proposal & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
- & Fixed-time, repeatedly tested & 1000/1000 & [99.6, 100.0] & 54 & 0 \\
- & Exact test with spending & 1000/1000 & [99.6, 100.0] & 240 & 0 \\
- & Paper's Hoeffding bound & 1000/1000 & [99.6, 100.0] & 1,461 & 0 \\
+0.890 & Direct activation & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
+ & \shortstack[r]{Repeated exact test} & 56/1000 & [4.3, 7.2] & 107 & 944 \\
+ & \shortstack[r]{Spent exact test} & 0/1000 & [0.0, 0.4] & -- & 1000 \\
+ & \shortstack[r]{Hoeffding bound} & 0/1000 & [0.0, 0.4] & -- & 1000 \\
+0.899 & Direct activation & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
+ & \shortstack[r]{Repeated exact test} & 190/1000 & [16.7, 21.5] & 249 & 810 \\
+ & \shortstack[r]{Spent exact test} & 0/1000 & [0.0, 0.4] & -- & 1000 \\
+ & \shortstack[r]{Hoeffding bound} & 0/1000 & [0.0, 0.4] & -- & 1000 \\
+0.980 & Direct activation & 1000/1000 & [99.6, 100.0] & 0 & 0 \\
+ & \shortstack[r]{Repeated exact test} & 1000/1000 & [99.6, 100.0] & 54 & 0 \\
+ & \shortstack[r]{Spent exact test} & 1000/1000 & [99.6, 100.0] & 240 & 0 \\
+ & \shortstack[r]{Hoeffding bound} & 1000/1000 & [99.6, 100.0] & 1,461 & 0 \\
 \bottomrule
-\end{tabular}}
+\end{tabular}
 \end{table}

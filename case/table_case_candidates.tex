@@ -1,0 +1,18 @@
+\begin{table}[t]
+\centering
+\small
+
+\caption{Case-study proposal pool and frozen AI scores on the selection prefix. The selected candidate is marked with an asterisk. The inadmissible candidate is not scored.}
+\label{tab:case-candidates}
+\begin{tabular}{@{}llllr@{}}
+\toprule
+Trigger & Response & Window & Structural check & Predicted margin \\
+\midrule
+$A$ & $B$ & $[1,4]$ & admissible & -0.4088 \\
+$A$ & $B$ & $[1,6]$ & admissible & -0.2144 \\
+$A$ & $B$ & $[1,8]^{*}$ & admissible & 0.0269 \\
+$A\land C$ & $B$ & $[1,8]$ & admissible & -0.3306 \\
+$A$ & $\top$ & $[1,8]$ & rejected & -- \\
+\bottomrule
+\end{tabular}
+\end{table}

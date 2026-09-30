@@ -1,15 +1,18 @@
 \begin{table}[t]
 \centering
 \small
-\caption{RQ3 sequential experiment with the frozen supervised AI proposer. `Below core' counts runs with at least one activation during a regime where $p^{\mathrm{core}}<\lambda_{\mathrm{core}}$.}
+\caption{ RQ3 sequential experiment with the frozen supervised AI proposer. `Below-core' counts runs with at least one activation during a regime where $p^{\mathrm{core}}<\lambda_{\mathrm{core}}$. 
+The oracle-composition column counts histories with at least one activation
+at which an oracle-composition average is below the corresponding
+certification threshold. This descriptive diagnostic, defined in the text,
+is distinct from the theorem's failure event.}
 \label{tab:rq3-sequential}
-\resizebox{\linewidth}{!}{%
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-Certification rule & Mean activations & Mean proposals & Below core & Sample-target failure \\
+\shortstack[l]{Rule} & \shortstack[r]{\shortstack{Mean\\activations}} & \shortstack[r]{\shortstack{Mean\\selections}} & Below-core & \shortstack[r]{\shortstack{Oracle\\composition}} \\
 \midrule
 Aggregate only & 4.82 & 5.82 & 27/100 & 0/100 \\
-Aggregate + core & 2.68 & 3.68 & 0/100 & 0/100 \\
+Joint & 2.68 & 3.68 & 0/100 & 0/100 \\
 \bottomrule
-\end{tabular}}
+\end{tabular}
 \end{table}
